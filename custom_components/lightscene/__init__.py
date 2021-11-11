@@ -1,1 +1,1 @@
-"""Light Scene""" 
+"""Light Scene"""

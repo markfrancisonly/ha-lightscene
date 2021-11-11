@@ -1,0 +1,56 @@
+default_config:
+
+logger:
+  default: error
+  logs:
+    custom_components.lightscene: debug
+    homeassistant.components.dhcp: fatal
+    scapy.runtime: fatal
+
+scene: !include scenes.yaml
+light:
+  - platform: lightscene
+
+panel_custom:
+  - name: ha_server_control
+    sidebar_title: Server Controls
+    sidebar_icon: mdi:server
+    js_url: /api/hassio/app/entrypoint.js
+    url_path: "config/server_control"
+    embed_iframe: true
+    require_admin: true
+    config:
+      ingress: core_configurator
+
+  - name: ha_entities
+    sidebar_title: Entities
+    sidebar_icon: mdi:shape
+    js_url: /api/hassio/app/entrypoint.js
+    url_path: "config/entities"
+    embed_iframe: true
+    require_admin: true
+    config:
+      ingress: core_configurator
+
+  - name: ha_scenes
+    sidebar_title: Scenes
+    sidebar_icon: mdi:palette
+    js_url: /api/hassio/app/entrypoint.js
+    url_path: "config/scene"
+    embed_iframe: true
+    require_admin: true
+    config:
+      ingress: core_configurator
+
+  - name: ha_integrations
+    sidebar_title: Integrations
+    sidebar_icon: mdi:puzzle
+    js_url: /api/hassio/app/entrypoint.js
+    url_path: "config/integrations"
+    embed_iframe: true
+    require_admin: true
+    config:
+      ingress: core_configurator
+
+# https://www.home-assistant.io/integrations/debugpy
+debugpy:
