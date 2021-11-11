@@ -1,5 +1,5 @@
 {
     "name": "Light Scene Integration for Home Assistant",
     "domains": ["light"],
-    "render_readme": true,
+    "render_readme": true
   }
