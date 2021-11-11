@@ -22,3 +22,10 @@ Easiest install is via [HACS](https://hacs.xyz/):
 
 `HACS -> Explore & Add Repositories -> Todo`
 
+
+Config flow is not supported yet. After installing the custom component via HACS, the lightscene integration platform must be manually added to the light sections of your configuration.yaml:
+
+```yaml
+light:
+  - platform: lightscene
+```
