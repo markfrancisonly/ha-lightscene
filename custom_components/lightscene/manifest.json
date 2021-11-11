@@ -2,6 +2,7 @@
   "domain": "lightscene",
   "name": "LightScene",
   "documentation": "https://github.com/markfrancisonly/hass-lightscene",
+  "issue_tracker": "https://github.com/markfrancisonly/hass-lightscene/issues",
   "dependencies": [],
   "codeowners": [
     "@markfrancisonly"
