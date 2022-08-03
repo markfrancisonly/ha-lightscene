@@ -2,7 +2,6 @@
 <!-- markdownlint-disable no-inline-html -->
 
 [![GitHub Release](https://img.shields.io/github/release/markfrancisonly/hass-lightscene.svg?style=flat-square)](https://github.com/markfrancisonly/hass-lightscene/releases)
-[![Build Status](https://img.shields.io/github/workflow/status/markfrancisonly/hass-lightscene/Build?style=flat-square)](https://github.com/markfrancisonly/hass-lightscene/actions/workflows/build.yaml)
 [![License](https://img.shields.io/github/license/markfrancisonly/hass-lightscene.svg?style=flat-square)](LICENSE)
 [![hacs](https://img.shields.io/badge/HACS-default-orange.svg?style=flat-square)](https://hacs.xyz)
 
