@@ -1,5 +1,5 @@
 {
-    "name": "Light Scene",
+    "name": "LightScene",
     "domains": ["light"],
     "render_readme": true
   }
