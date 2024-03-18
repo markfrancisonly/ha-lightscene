@@ -7,6 +7,7 @@ import voluptuous as vol
 
 from homeassistant.components.light import (
     LightEntity,
+    ColorMode,
     # ATTR_BRIGHTNESS,
     # ATTR_TRANSITION,
     # SUPPORT_BRIGHTNESS,
@@ -236,6 +237,10 @@ class LightScene(LightEntity):
         self._scene_entity_id = scene_entity_id
         self._scene_entities = scene_entity_ids
         self._entity_filter = entity_filter
+        
+        self._color_mode = ColorMode.ONOFF
+        self._supported_color_modes: set[ColorMode] = set()
+        self._supported_color_modes.add(ColorMode.ONOFF)
 
         self._attr_should_poll = False
         self._attr_supported_features = 0  # SUPPORT_BRIGHTNESS todo
@@ -246,6 +251,17 @@ class LightScene(LightEntity):
         self._attr_name = name
         self._attr_extra_state_attributes = {ATTR_ENTITY_ID: self._scene_entities}
 
+
+    @property
+    def supported_color_modes(self) -> set[ColorMode] | None:
+        """Flag supported features."""
+        return self._supported_color_modes
+    
+    @property
+    def color_mode(self) -> str | None:
+        """Return the color mode of the light."""
+        return self._color_mode
+    
     async def async_remove(self, *, force_remove: bool = False) -> None:
         if not self._removed:
             _LOGGER.debug("Removed %s", self.name)
