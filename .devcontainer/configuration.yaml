@@ -8,8 +8,6 @@ logger:
     scapy.runtime: fatal
 
 scene: !include scenes.yaml
-light:
-  - platform: lightscene
 
 panel_custom:
   - name: ha_server_control
