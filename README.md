@@ -36,8 +36,8 @@ Light scenes can be turned on via the Home Assistant UI or through a service cal
 ```yaml
 service: light.turn_on
 data:
-	entity_id: light.evening_lights
-	brightness: 150
+  entity_id: light.evening_lights
+  brightness: 150
 ```
 
 ### Turning Off a Light Scene
@@ -47,7 +47,7 @@ Turn off the light scene with:
 ```yaml
 service: light.turn_off
 data:
-	entity_id: light.evening_lights
+  entity_id: light.evening_lights
 ```
 
 ### Dynamic Brightness Scaling
@@ -71,7 +71,6 @@ logger:
   default: warning
   logs:
     custom_components.lightscene: debug
-
 ```
 
 ## Installation
