@@ -1,0 +1,7 @@
+{
+    "config": {
+        "abort": {
+            "single_instance_allowed": "Light Scenes is already set up."
+        }
+    }
+}
