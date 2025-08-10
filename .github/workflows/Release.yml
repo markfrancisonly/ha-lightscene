@@ -1,0 +1,38 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+jobs:
+  release:
+    name: Prepare release asset
+    runs-on: ubuntu-latest
+    steps:
+      - name: ⤵️ Check out code from GitHub
+        uses: actions/checkout@v4
+
+      - name: 🔢 Adjust version number
+        shell: bash
+        run: |
+          version="${{ github.event.release.tag_name }}"
+          version="${version,,}"
+          version="${version#v}"
+          yq e -P -o=json \
+            -i ".version = \"${version}\"" \
+            "${{ github.workspace }}/custom_components/lightscene/manifest.json"
+
+      - name: 📦 Created zipped release package
+        run: |
+          cd "${{ github.workspace }}/custom_components/lightscene"
+          zip lightscene.zip -r ./
+
+      - name: ⬆️ Upload zip to release
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: "${{ github.workspace }}/custom_components/lightscene/lightscene.zip"
+          asset_name: lightscene.zip
+          tag: ${{ github.ref }}
+          overwrite: true
