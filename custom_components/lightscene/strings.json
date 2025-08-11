@@ -1,7 +1,26 @@
 {
-    "config": {
-        "abort": {
-            "single_instance_allowed": "Light Scenes is already set up."
+  "config": {
+    "abort": {
+      "single_instance_allowed": "LightScene is already set up.",
+      "no_scenes_found": "No scenes are available to select."
+    },
+    "step": {
+      "user": {
+        "title": "LightScene Setup",
+        "data": {
+          "scenes": "Scenes to operate as a light:"
         }
+      }
     }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "LightScene Options",
+        "data": {
+          "scenes": "Scenes to operate as a light:"
+        }
+      }
+    }
+  }
 }
