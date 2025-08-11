@@ -1,5 +1,7 @@
 {
-    "name": "LightScene",
-    "domains": ["light"],
-    "render_readme": true
-  }
+  "name": "LightScene",
+  "homeassistant": "2025.1.0",
+  "hacs": "2.0.0",
+  "zip_release": true,
+  "filename": "lightscene.zip"
+}

@@ -2,48 +2,34 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections.abc import Mapping
 from typing import Any, Dict, cast
 
-from homeassistant.core import (
-    Event,
-    HomeAssistant,
-    CoreState,
-    Context,
-    State,
+from homeassistant.components.homeassistant.scene import (
+    DATA_PLATFORM as HOMEASSISTANT_SCENE_DATA_PLATFORM,
 )
+from homeassistant.components.homeassistant.scene import (
+    EVENT_SCENE_RELOADED,
+    HomeAssistantScene,
+    SceneConfig,
+)
+from homeassistant.components.light import ATTR_BRIGHTNESS, ColorMode, LightEntity
+from homeassistant.components.scene import DOMAIN as SCENE_DOMAIN
+from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     ATTR_DOMAIN,
     ATTR_ENTITY_ID,
-    STATE_OFF,
-    STATE_ON,
     ATTR_SERVICE,
     ATTR_SERVICE_DATA,
     EVENT_CALL_SERVICE,
     SERVICE_TURN_ON,
+    STATE_OFF,
+    STATE_ON,
 )
-from homeassistant.components.light import (
-    LightEntity,
-    ColorMode,
-    ATTR_BRIGHTNESS,
-)
-
+from homeassistant.core import Context, CoreState, Event, HomeAssistant, State
+from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.state import async_reproduce_state
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.helpers.entity_platform import AddEntitiesCallback
-
-from collections.abc import Mapping
-
-from homeassistant.components.scene import (
-    DOMAIN as SCENE_DOMAIN,
-)
-from homeassistant.components.homeassistant.scene import (
-    DATA_PLATFORM as HOMEASSISTANT_SCENE_DATA_PLATFORM,
-    HomeAssistantScene,
-    SceneConfig,
-    EVENT_SCENE_RELOADED,
-)
-
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -51,6 +37,9 @@ DEFAULT_BRIGHTNESS = 255
 EVENT_NEW_STATE = "new_state"
 
 from .const import DATA_MANAGER
+
+# Option key used to control which scenes are disabled by default (all others enabled)
+CONF_DISABLED_SCENES = "disabled_scenes"
 
 
 async def async_setup_entry(
@@ -82,6 +71,7 @@ class LightSceneManager:
         self.lightscenes: Dict[str, LightScene] = {}
         self.hass = hass
         self.async_add_entities = async_add_entities
+        self.config_entry = config_entry
 
         self.listener_scene_reloaded_release = None
         self.listener_scene_activated_release = None
@@ -162,6 +152,13 @@ class LightSceneManager:
 
         scene_platform = self.hass.data[HOMEASSISTANT_SCENE_DATA_PLATFORM]
 
+        # Read disabled scenes from options (entities listed here will be disabled by default)
+        disabled: set[str] = set()
+        if self.config_entry is not None:
+            opts = self.config_entry.options or {}
+            if isinstance(opts.get(CONF_DISABLED_SCENES), list):
+                disabled = set(opts[CONF_DISABLED_SCENES])
+
         new_entities = []
         for entity_id, scene_entity in scene_platform.entities.items():
             if not isinstance(scene_entity, HomeAssistantScene):
@@ -176,6 +173,7 @@ class LightSceneManager:
                 hass=self.hass,
                 scene_entity_id=entity_id,
                 scene_config=cast(HomeAssistantScene, scene_entity).scene_config,
+                is_disabled_by_default=(entity_id in disabled),
             )
             self.lightscenes[entity_id] = lightscene
             new_entities.append(lightscene)
@@ -230,7 +228,11 @@ class LightScene(LightEntity):
     """
 
     def __init__(
-        self, hass: HomeAssistant, scene_entity_id: str, scene_config: SceneConfig
+        self,
+        hass: HomeAssistant,
+        scene_entity_id: str,
+        scene_config: SceneConfig,
+        is_disabled_by_default: bool = False,
     ):
         self.hass = hass
         self.scene_entity_id = scene_entity_id
@@ -241,6 +243,9 @@ class LightScene(LightEntity):
         self._is_on = False
         self._context: Context | None = None
         self._internal_contexts: set[str] = set()
+
+        # Control default enabled/disabled status in the entity registry
+        self._attr_entity_registry_enabled_default = not is_disabled_by_default
 
         self._scene_brightness_levels: Dict[str, int] = {}
         self._busy_reproducing_states = asyncio.Event()
