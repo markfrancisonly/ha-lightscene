@@ -9,6 +9,5 @@
   "iot_class": "local_push",
   "issue_tracker": "https://github.com/markfrancisonly/ha-lightscene/issues",
   "requirements": [],
-  "single_instance": true,
   "version": "1.1.0"
 }
