@@ -34,6 +34,7 @@ from homeassistant.helpers.state import async_reproduce_state
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_BRIGHTNESS = 255
+REPRODUCE_TIMEOUT_SECONDS = 60
 EVENT_NEW_STATE = "new_state"
 
 from .const import DATA_MANAGER
@@ -204,23 +205,6 @@ class LightSceneManager:
 
         self.lightscenes.clear()
 
-    async def wait_all_busy_reproducing_states(self):
-        """
-        Wait until all LightScene instances are not busy reproducing states.
-        """
-        # Gather all wait calls for each scene's event. Each wait returns when that scene is ready.
-        # We want them all to be set (ready), so we wait until they all complete.
-        if not self.lightscenes:
-            return
-
-        await asyncio.gather(
-            *(
-                light._busy_reproducing_states.wait()
-                for light in self.lightscenes.values()
-                if light is not None
-            )
-        )
-
 
 class LightScene(LightEntity):
     """
@@ -250,6 +234,8 @@ class LightScene(LightEntity):
         self._scene_brightness_levels: Dict[str, int] = {}
         self._busy_reproducing_states = asyncio.Event()
         self._busy_reproducing_states.set()
+        self._reproduce_task: asyncio.Task | None = None
+        self._cancelled_reproduce = False
 
         # determine baseline brightness
         scene_brightness_values = []
@@ -391,9 +377,7 @@ class LightScene(LightEntity):
         """
         Turn on or adjust brightness of the LightScene.
         """
-        if manager := self.hass.data.get(DATA_MANAGER):
-            await cast(LightSceneManager, manager).wait_all_busy_reproducing_states()
-
+        await self._cancel_in_flight()
         await self._busy_reproducing_states.wait()
 
         try:
@@ -461,26 +445,26 @@ class LightScene(LightEntity):
             self._is_on = True
             self.async_write_ha_state()
 
-            self._busy_reproducing_states.clear()
-            await async_reproduce_state(
-                self.hass, states_to_reproduce, context=self._context
-            )
-
+            await self._start_reproduce(states_to_reproduce, "states")
+        except asyncio.CancelledError:
+            if self._cancelled_reproduce:
+                _LOGGER.debug("Reproduce task cancelled for %s", self.name)
+                return
+            raise
         except Exception as e:
             _LOGGER.error("Error turning on LightScene %s: %s", self.name, e)
             raise
 
         finally:
+            self._reproduce_task = None
+            self._cancelled_reproduce = False
             self._busy_reproducing_states.set()
 
     async def async_turn_off(self, **kwargs):
         """
         Turn off the LightScene by setting all entities off using async_reproduce_state.
         """
-
-        if manager := self.hass.data.get(DATA_MANAGER):
-            await cast(LightSceneManager, manager).wait_all_busy_reproducing_states()
-
+        await self._cancel_in_flight()
         await self._busy_reproducing_states.wait()
 
         try:
@@ -495,14 +479,19 @@ class LightScene(LightEntity):
 
             self._set_off()
 
-            self._busy_reproducing_states.clear()
-            await async_reproduce_state(self.hass, off_states, context=self._context)
-
+            await self._start_reproduce(off_states, "off states")
+        except asyncio.CancelledError:
+            if self._cancelled_reproduce:
+                _LOGGER.debug("Reproduce task cancelled for %s", self.name)
+                return
+            raise
         except Exception as e:
             _LOGGER.error("Error turning off LightScene %s: %s", self.name, e)
             raise
 
         finally:
+            self._reproduce_task = None
+            self._cancelled_reproduce = False
             self._busy_reproducing_states.set()
 
     def _set_off(self):
@@ -515,3 +504,49 @@ class LightScene(LightEntity):
         self.async_write_ha_state()
 
         _LOGGER.info("%s turned off", self.name)
+
+    async def _cancel_in_flight(self) -> None:
+        """Cancel any in-flight reproduce task so a new toggle can proceed."""
+        task = self._reproduce_task
+        if task is None or task.done():
+            return
+
+        _LOGGER.debug("Cancelling in-flight reproduce task for %s", self.name)
+        self._cancelled_reproduce = True
+        await self._drain_reproduce_task()
+        self._cancelled_reproduce = False
+        # Ensure waiters are unblocked even if the task was cancelled mid-flight.
+        self._busy_reproducing_states.set()
+
+    async def _drain_reproduce_task(self) -> None:
+        """Cancel and await an in-flight reproduce task after a timeout."""
+        task = self._reproduce_task
+        if task is None or task.done():
+            return
+
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._reproduce_task = None
+
+    async def _start_reproduce(self, states: list[State], label: str) -> None:
+        """Reproduce states with timeout handling."""
+        self._busy_reproducing_states.clear()
+        self._reproduce_task = asyncio.create_task(
+            async_reproduce_state(self.hass, states, context=self._context)
+        )
+        try:
+            await asyncio.wait_for(
+                self._reproduce_task, timeout=REPRODUCE_TIMEOUT_SECONDS
+            )
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "Timed out reproducing %s for %s after %s seconds",
+                label,
+                self.name,
+                REPRODUCE_TIMEOUT_SECONDS,
+            )
+            await self._drain_reproduce_task()
