@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Mapping
+from functools import partial
 from typing import Any, Dict, cast
 
 from homeassistant.components.homeassistant.scene import (
@@ -22,22 +23,38 @@ from homeassistant.const import (
     ATTR_SERVICE,
     ATTR_SERVICE_DATA,
     EVENT_CALL_SERVICE,
+    EVENT_HOMEASSISTANT_STARTED,
     SERVICE_TURN_ON,
     STATE_OFF,
     STATE_ON,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
 )
-from homeassistant.core import Context, CoreState, Event, HomeAssistant, State
+from homeassistant.core import Context, CoreState, Event, HomeAssistant, State, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
-from homeassistant.helpers.event import async_track_state_change_event
+from homeassistant.helpers.event import async_call_later, async_track_state_change_event
+from homeassistant.helpers.restore_state import RestoreEntity
 from homeassistant.helpers.state import async_reproduce_state
+
+from .const import DATA_MANAGER
 
 _LOGGER = logging.getLogger(__name__)
 
 DEFAULT_BRIGHTNESS = 255
 REPRODUCE_TIMEOUT_SECONDS = 60
-EVENT_NEW_STATE = "new_state"
 
-from .const import DATA_MANAGER
+# State matching: a LightScene is ON when its members' CURRENT states match the
+# scene at ANY uniform brightness scale (see SceneStateCoordinator). Evaluation
+# is debounced so fades/reproduces settle before on-ness is decided; tolerances
+# absorb device quantization (e.g. Z-Wave's 0-99 dimmer scale).
+SETTLE_SECONDS = 1.0
+BRIGHTNESS_TOLERANCE = 5          # per member, on the 0-255 scale
+COLOR_TEMP_KELVIN_TOLERANCE = 150 # more drift than this is a different scene
+COLOR_TEMP_MIREDS_TOLERANCE = 10
+HS_HUE_TOLERANCE = 10.0
+HS_SAT_TOLERANCE = 10.0
+RGB_TOLERANCE = 30                # euclidean distance
+XY_TOLERANCE = 0.05
 
 # Option key used to control which scenes are disabled by default (all others enabled)
 CONF_DISABLED_SCENES = "disabled_scenes"
@@ -76,6 +93,7 @@ class LightSceneManager:
 
         self.listener_scene_reloaded_release = None
         self.listener_scene_activated_release = None
+        self.coordinator = SceneStateCoordinator(hass, self)
 
         _LOGGER.debug("Initialized LightSceneManager")
 
@@ -86,17 +104,23 @@ class LightSceneManager:
         _LOGGER.debug("Scenes reloaded")
         await self.async_load_lightscenes()
 
+    @staticmethod
+    @callback
+    def _scene_turn_on_filter(event_data) -> bool:
+        """Bus-side filter: only scene.turn_on service calls reach the listener.
+
+        EVENT_CALL_SERVICE fires for EVERY service call in the system; without
+        this filter each one scheduled an async task just to check the domain
+        and return. The filter runs synchronously inside the bus and schedules
+        nothing for non-matching events."""
+        return (
+            event_data.get(ATTR_DOMAIN) == SCENE_DOMAIN
+            and event_data.get(ATTR_SERVICE) == SERVICE_TURN_ON
+        )
+
     async def async_scene_activated_event_listener(self, event: Event) -> None:
         """Process scene.turn_on events to turn on corresponding LightScene entity."""
         try:
-            domain = event.data.get(ATTR_DOMAIN)
-            if domain != SCENE_DOMAIN:
-                return
-
-            service = event.data.get(ATTR_SERVICE)
-            if service != SERVICE_TURN_ON:
-                return
-
             service_data = event.data.get(ATTR_SERVICE_DATA, {})
             entity_id = service_data.get(ATTR_ENTITY_ID)
             if not entity_id:
@@ -141,7 +165,9 @@ class LightSceneManager:
         )
 
         self.listener_scene_activated_release = self.hass.bus.async_listen(
-            EVENT_CALL_SERVICE, self.async_scene_activated_event_listener
+            EVENT_CALL_SERVICE,
+            self.async_scene_activated_event_listener,
+            event_filter=self._scene_turn_on_filter,
         )
 
         if HOMEASSISTANT_SCENE_DATA_PLATFORM not in self.hass.data:
@@ -172,6 +198,7 @@ class LightSceneManager:
 
             lightscene = LightScene(
                 hass=self.hass,
+                manager=self,
                 scene_entity_id=entity_id,
                 scene_config=cast(HomeAssistantScene, scene_entity).scene_config,
                 is_disabled_by_default=(entity_id in disabled),
@@ -183,12 +210,17 @@ class LightSceneManager:
             self.async_add_entities(new_entities)
             _LOGGER.debug("Added %d LightScene entities.", len(self.lightscenes))
 
+        # (Re)index memberships and (re)subscribe the shared state listener.
+        self.coordinator.async_rebuild()
+
     async def async_unload_lightscenes(self):
         """Clean up event listeners and remove entities."""
 
         _LOGGER.debug(
             "Unloading all LightScene entities",
         )
+
+        self.coordinator.async_shutdown()
 
         if self.listener_scene_reloaded_release:
             self.listener_scene_reloaded_release()
@@ -206,27 +238,362 @@ class LightSceneManager:
         self.lightscenes.clear()
 
 
-class LightScene(LightEntity):
+class SceneStateCoordinator:
+    """Central routing + matching engine: derives each LightScene's on-ness from
+    the CURRENT states of its members, so a scene reached by any path (manual
+    dimming, another automation, restart restore) reads as on — ground truth
+    instead of activation bookkeeping.
+
+    One state subscription covers the union of all scene members (HA core routes
+    it keyed by entity_id, so dispatch stays O(1)); a reverse index maps each
+    change to the affected scenes; evaluation is debounced per scene so light
+    fades and our own reproduces settle before on-ness is decided.
     """
-    A LightScene entity representing a scene with brightness scaling and context tracking.
+
+    def __init__(self, hass: HomeAssistant, manager: "LightSceneManager") -> None:
+        self.hass = hass
+        self.manager = manager
+        self._member_to_scenes: Dict[str, set] = {}
+        self._scale_bands: Dict[str, tuple] = {}
+        self._strict_supersets: Dict[str, list] = {}
+        self._unsub_states = None
+        self._unsub_started = None
+        self._timers: Dict[str, Any] = {}
+
+    def async_rebuild(self) -> None:
+        """(Re)index members and (re)subscribe after discovery or scene reload."""
+        self._unsubscribe_states()
+        self._member_to_scenes = {}
+        for scene_id, scene in self.manager.lightscenes.items():
+            for member in scene.scene_config.states:
+                self._member_to_scenes.setdefault(member, set()).add(scene_id)
+                # Group lights hide member changes behind an aggregate that may
+                # not move (e.g. offsetting changes); index the members too so
+                # their individual changes re-evaluate the scene.
+                for expanded in self._group_members(member):
+                    self._member_to_scenes.setdefault(expanded, set()).add(scene_id)
+
+        # Ambiguity families: scenes with IDENTICAL member sets and proportional
+        # targets are indistinguishable under free scaling (a single shared
+        # light is the degenerate case — any level fits some scale). Within a
+        # family the brightness ORDER is the only distinguishing data: the tiers
+        # partition the level axis into EXCLUSIVE bands, each ending where the
+        # next tier begins, so exactly one tier claims any level (Kitchen 75 /
+        # Cooking 127: at 127 Cooking takes over and Kitchen reads off). The
+        # dimmest tier keeps free downscale, the brightest free upscale.
+        families: Dict[tuple, list] = {}
+        for scene in self.manager.lightscenes.values():
+            families.setdefault(self._family_key(scene), []).append(scene)
+        self._scale_bands = {}
+        for group in families.values():
+            if len(group) < 2:
+                continue
+            group.sort(key=lambda member: member.scene_brightness)
+            for index, scene in enumerate(group):
+                lower = 0.0 if index == 0 else scene.scene_brightness - BRIGHTNESS_TOLERANCE
+                upper = (
+                    group[index + 1].scene_brightness - BRIGHTNESS_TOLERANCE
+                    if index + 1 < len(group)
+                    else None
+                )
+                self._scale_bands[scene.scene_entity_id] = (lower, upper)
+            _LOGGER.debug(
+                "Ambiguity family %s: exclusive level bands %s",
+                [member.name for member in group],
+                {member.name: self._scale_bands[member.scene_entity_id] for member in group},
+            )
+
+        # Most-specific-match-wins: a scene whose member set is a strict
+        # SUBSET of another scene's matches coincidentally whenever the
+        # superset scene is active — its members sit at those levels because
+        # the superset scene put them there, and free downscale then reads
+        # the subset scene as a dimmed variant (Master Bath {bath_light}
+        # inside Shower {shower_light, bath_light}: Shower on showed BOTH
+        # on). At evaluation a matching scene is suppressed while any
+        # strict-superset scene also matches; once the superset stops
+        # matching, the subset's own match stands on its own.
+        member_sets = {
+            scene_id: set(scene.scene_config.states)
+            for scene_id, scene in self.manager.lightscenes.items()
+        }
+        self._strict_supersets = {
+            scene_id: [
+                other_id
+                for other_id, other_members in member_sets.items()
+                if other_id != scene_id and members < other_members
+            ]
+            for scene_id, members in member_sets.items()
+        }
+        # A suppressed subset scene must re-evaluate when the SUPERSET's
+        # members change (its own members may not move when the superset
+        # scene ends) — index it under those members too.
+        for scene_id, supersets in self._strict_supersets.items():
+            for other_id in supersets:
+                for member in member_sets[other_id]:
+                    self._member_to_scenes.setdefault(member, set()).add(scene_id)
+
+        if self._member_to_scenes:
+            self._unsub_states = async_track_state_change_event(
+                self.hass, list(self._member_to_scenes), self._handle_member_event
+            )
+
+        # First sweep: immediately when running; else once HA has fully started
+        # (members restore/report at varying times during boot — each arrival
+        # re-triggers evaluation through the subscription anyway).
+        if self.hass.state == CoreState.running:
+            self.async_schedule_all()
+        elif self._unsub_started is None:
+            self._unsub_started = self.hass.bus.async_listen_once(
+                EVENT_HOMEASSISTANT_STARTED, self._handle_started
+            )
+
+    def _group_members(self, entity_id: str, depth: int = 0) -> list:
+        """Member entity_ids of a group light (recursive, bounded), else []."""
+        if depth >= 2 or not entity_id.startswith("light."):
+            return []
+        state = self.hass.states.get(entity_id)
+        members = state.attributes.get(ATTR_ENTITY_ID) if state else None
+        if not isinstance(members, (list, tuple)):
+            return []
+        expanded = []
+        for member in members:
+            if isinstance(member, str):
+                expanded.append(member)
+                expanded.extend(self._group_members(member, depth + 1))
+        return expanded
+
+    @staticmethod
+    def _family_key(scene: "LightScene") -> tuple:
+        """Scenes with equal keys are scale-indistinguishable: same members,
+        same non-scalable states, proportional brightness targets."""
+        parts = []
+        for entity_id in sorted(scene.targets):
+            target = scene.targets[entity_id]
+            brightness = target.get("brightness")
+            if (
+                target["state"] == STATE_ON
+                and isinstance(brightness, (int, float))
+                and brightness > 0
+            ):
+                # Normalize against the scene's own baseline: proportional
+                # scenes collapse to the same ratios.
+                parts.append((entity_id, "on", round(brightness / scene.scene_brightness, 2)))
+            else:
+                parts.append((entity_id, target["state"], None))
+        return tuple(parts)
+
+    @callback
+    def _handle_started(self, _event: Event) -> None:
+        self._unsub_started = None
+        self.async_schedule_all()
+
+    def async_schedule_all(self) -> None:
+        for scene_id in self.manager.lightscenes:
+            self.async_schedule(scene_id)
+
+    @callback
+    def _handle_member_event(self, event: Event) -> None:
+        entity_id = event.data.get(ATTR_ENTITY_ID)
+        for scene_id in self._member_to_scenes.get(entity_id, ()):
+            self.async_schedule(scene_id)
+
+    def async_schedule(self, scene_id: str, delay: float = SETTLE_SECONDS) -> None:
+        """Debounced: evaluate once events stop for `delay` (resets per event)."""
+        self._cancel_timer(scene_id)
+        self._timers[scene_id] = async_call_later(
+            self.hass, delay, partial(self._evaluate, scene_id)
+        )
+
+    def _cancel_timer(self, scene_id: str) -> None:
+        timer = self._timers.pop(scene_id, None)
+        if timer:
+            timer()
+
+    @callback
+    def _evaluate(self, scene_id: str, _now=None) -> None:
+        self._timers.pop(scene_id, None)
+        scene = self.manager.lightscenes.get(scene_id)
+        if scene is None:
+            return
+        if scene.is_reproducing:
+            # Our own service calls are mid-flight; look again once they settle.
+            self.async_schedule(scene_id)
+            return
+        matched, brightness = self._match(scene)
+        if matched is None:
+            # A member is unavailable/unknown (e.g. still restoring after boot):
+            # no verdict — keep the current (possibly restored) state. The member
+            # reporting in re-triggers evaluation through the subscription.
+            return
+        if matched:
+            # Most-specific-match-wins (see async_rebuild): suppressed while
+            # any strict-superset scene also matches.
+            for other_id in self._strict_supersets.get(scene_id, ()):
+                other = self.manager.lightscenes.get(other_id)
+                if other is not None and self._match(other)[0]:
+                    matched, brightness = False, None
+                    break
+        scene.apply_match(matched, brightness)
+
+    def _match(self, scene: "LightScene"):
+        """Scale-aware match of current member states against the scene.
+
+        Returns (matched, effective_brightness). Matched means: one uniform
+        scale factor maps every baseline to the current brightness (within
+        tolerance), off-members are off, colors haven't drifted, and non-light
+        members are in their scene state. A member with no usable state yields
+        None (no verdict) rather than False.
+        """
+        scales = []  # (current, baseline) for scalable on-lights
+        for entity_id, target in scene.targets.items():
+            state = self.hass.states.get(entity_id)
+            if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+                return None, None
+
+            if target["state"] != STATE_ON:
+                if state.state != target["state"]:
+                    return False, None
+                continue
+
+            if state.state != STATE_ON:
+                return False, None
+            if not entity_id.startswith("light."):
+                continue
+
+            baseline = target.get("brightness") or 0
+
+            # A group light reads ON when ANY member is on, and its brightness
+            # is the mean of the ON members — one lamp could impersonate
+            # "everything at max". The scene's group target means EVERY member
+            # at that level, so match the members individually (a uniform
+            # scale across them still counts, like any other member).
+            group_members = state.attributes.get(ATTR_ENTITY_ID)
+            if isinstance(group_members, (list, tuple)) and group_members:
+                verdict = self._match_group(target, baseline, group_members, scales)
+                if verdict is not True:
+                    return verdict, None
+                continue
+
+            if not self._color_matches(target, state):
+                return False, None
+            current = state.attributes.get(ATTR_BRIGHTNESS)
+            if baseline > 0 and isinstance(current, (int, float)):
+                scales.append((int(current), baseline))
+
+        if not scales:
+            return True, None
+
+        mean_scale = sum(current / baseline for current, baseline in scales) / len(scales)
+        if mean_scale <= 0:
+            return False, None
+
+        # Tiered mode disambiguation: within an ambiguity family, exactly one
+        # tier claims any level — this scene's band runs from its own baseline
+        # to the next tier's (dimmest reaches down to 0, brightest up forever).
+        band = self._scale_bands.get(scene.scene_entity_id)
+        if band is not None:
+            level = mean_scale * scene.scene_brightness
+            lower, upper = band
+            if level < lower or (upper is not None and level >= upper):
+                return False, None
+
+        for current, baseline in scales:
+            expected = max(1, min(255, round(baseline * mean_scale)))
+            if abs(current - expected) > BRIGHTNESS_TOLERANCE:
+                return False, None
+
+        return True, max(1, min(255, round(scene.scene_brightness * mean_scale)))
+
+    def _match_group(self, target, baseline, members, scales, depth: int = 0):
+        """Match every member of a group target individually.
+
+        Tri-state like _match: True (all members fit), False (a member is off
+        or drifted), None (a member has no usable state -> no verdict)."""
+        if depth >= 2:
+            return True
+        for member_id in members:
+            if not isinstance(member_id, str):
+                continue
+            state = self.hass.states.get(member_id)
+            if state is None or state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
+                return None
+            if state.state != STATE_ON:
+                return False
+            nested = state.attributes.get(ATTR_ENTITY_ID)
+            if isinstance(nested, (list, tuple)) and nested:
+                verdict = self._match_group(target, baseline, nested, scales, depth + 1)
+                if verdict is not True:
+                    return verdict
+                continue
+            if not self._color_matches(target, state):
+                return False
+            current = state.attributes.get(ATTR_BRIGHTNESS)
+            if baseline > 0 and isinstance(current, (int, float)):
+                scales.append((int(current), baseline))
+        return True
+
+    @staticmethod
+    def _color_matches(target, state: State) -> bool:
+        """Colors are a match-breaker, not scaled: drifted color != same scene."""
+        color = target.get("color")
+        if not color:
+            return True
+        kind, want = color
+        have = state.attributes.get(kind)
+        if have is None:
+            return False
+        try:
+            if kind == "color_temp_kelvin":
+                return abs(have - want) <= COLOR_TEMP_KELVIN_TOLERANCE
+            if kind == "color_temp":
+                return abs(have - want) <= COLOR_TEMP_MIREDS_TOLERANCE
+            if kind == "hs_color":
+                hue_delta = abs(((have[0] - want[0]) + 180) % 360 - 180)
+                return hue_delta <= HS_HUE_TOLERANCE and abs(have[1] - want[1]) <= HS_SAT_TOLERANCE
+            if kind == "rgb_color":
+                return sum((h - w) ** 2 for h, w in zip(have, want)) ** 0.5 <= RGB_TOLERANCE
+            if kind == "xy_color":
+                return all(abs(h - w) <= XY_TOLERANCE for h, w in zip(have, want))
+        except (TypeError, IndexError):
+            return False
+        return True
+
+    def async_shutdown(self) -> None:
+        self._unsubscribe_states()
+        if self._unsub_started:
+            self._unsub_started()
+            self._unsub_started = None
+        for scene_id in list(self._timers):
+            self._cancel_timer(scene_id)
+
+    def _unsubscribe_states(self) -> None:
+        if self._unsub_states:
+            self._unsub_states()
+            self._unsub_states = None
+
+
+class LightScene(LightEntity, RestoreEntity):
+    """
+    A LightScene entity representing a scene with brightness scaling and
+    state-matched on-ness (see SceneStateCoordinator).
     """
 
     def __init__(
         self,
         hass: HomeAssistant,
+        manager: "LightSceneManager",
         scene_entity_id: str,
         scene_config: SceneConfig,
         is_disabled_by_default: bool = False,
     ):
         self.hass = hass
+        self.manager = manager
         self.scene_entity_id = scene_entity_id
         self.scene_config = scene_config
 
         self._attr_should_poll = False
         self._attr_unique_id = f"{scene_entity_id}_light_scene"
         self._is_on = False
-        self._context: Context | None = None
-        self._internal_contexts: set[str] = set()
 
         # Control default enabled/disabled status in the entity registry
         self._attr_entity_registry_enabled_default = not is_disabled_by_default
@@ -237,18 +604,37 @@ class LightScene(LightEntity):
         self._reproduce_task: asyncio.Task | None = None
         self._cancelled_reproduce = False
 
-        # determine baseline brightness
+        # Compile the matching target table (used by the coordinator) while
+        # determining the baseline brightness.
         scene_brightness_values = []
-        self._scene_brightness_levels = {}
+        self._targets: Dict[str, Dict[str, Any]] = {}
         for entity_id, state in self.scene_config.states.items():
+            target: Dict[str, Any] = {"state": state.state}
             if entity_id.startswith("light."):
                 brightness = state.attributes.get(ATTR_BRIGHTNESS)
                 if brightness is None:
                     brightness = 255 if state.state == STATE_ON else 0
                 self._scene_brightness_levels[entity_id] = brightness
+                target["brightness"] = brightness
 
                 if state.state == STATE_ON and brightness > 0:
                     scene_brightness_values.append(brightness)
+
+                # Capture the scene's color (first color representation found);
+                # matching treats color drift as "not this scene".
+                for kind in ("color_temp_kelvin", "color_temp", "hs_color", "rgb_color", "xy_color"):
+                    value = state.attributes.get(kind)
+                    if value is not None:
+                        target["color"] = (
+                            kind,
+                            tuple(value) if isinstance(value, (list, tuple)) else value,
+                        )
+                        break
+            self._targets[entity_id] = target
+
+        # All-off scenes only ever turn on via explicit activation — otherwise
+        # they would read "on" any time their lights happen to be off.
+        self._auto_on_eligible = any(t["state"] == STATE_ON for t in self._targets.values())
 
         if scene_brightness_values:
             self._scene_brightness = sum(scene_brightness_values) // len(
@@ -288,15 +674,74 @@ class LightScene(LightEntity):
         return self._brightness
 
     @property
+    def targets(self) -> Dict[str, Dict[str, Any]]:
+        """Per-member matching targets compiled from the scene config."""
+        return self._targets
+
+    @property
+    def scene_brightness(self) -> int:
+        """Baseline brightness the scale factor is expressed against."""
+        return self._scene_brightness
+
+    @property
+    def is_reproducing(self) -> bool:
+        """True while this entity's own reproduce is in flight."""
+        return not self._busy_reproducing_states.is_set()
+
+    @callback
+    def apply_match(self, matched: bool, brightness: int | None) -> None:
+        """Coordinator verdict: member states match (a uniform scale of) this
+        scene, or not. Turning ON requires auto-on eligibility (all-off scenes
+        stay activation-driven); turning OFF always applies."""
+        if self.hass is None or self.entity_id is None:
+            return
+
+        if matched:
+            if not self._is_on and not self._auto_on_eligible:
+                return
+            new_brightness = self._brightness
+            if brightness is not None and self._has_brightness_control:
+                new_brightness = brightness
+            if self._is_on and new_brightness == self._brightness:
+                return
+            was_on = self._is_on
+            self._is_on = True
+            self._brightness = new_brightness
+            _LOGGER.info(
+                "%s %s current light states%s",
+                self.name,
+                "matches" if not was_on else "re-matched",
+                f" at brightness {new_brightness}" if self._has_brightness_control else "",
+            )
+            self.async_write_ha_state()
+        elif self._is_on:
+            self._is_on = False
+            _LOGGER.info("%s no longer matches current light states", self.name)
+            self.async_write_ha_state()
+
+    @property
     def extra_state_attributes(self) -> Mapping[str, Any]:
         """Return the scene state attributes."""
         attributes: dict[str, Any] = {ATTR_ENTITY_ID: list(self.scene_config.states)}
         return attributes
 
     async def async_added_to_hass(self):
-        """
-        Called when LightScene is added to hass
-        """
+        """Restore a provisional state; the coordinator's first sweep after the
+        members report replaces it with matched ground truth. State watching is
+        centralized in the coordinator — no per-entity subscription here."""
+
+        await super().async_added_to_hass()
+
+        last = await self.async_get_last_state()
+        if last is not None:
+            self._is_on = last.state == STATE_ON
+            restored = last.attributes.get(ATTR_BRIGHTNESS)
+            if (
+                self._has_brightness_control
+                and isinstance(restored, (int, float))
+                and restored > 0
+            ):
+                self._brightness = int(restored)
 
         if self._has_brightness_control:
             _LOGGER.debug(
@@ -307,71 +752,25 @@ class LightScene(LightEntity):
         else:
             _LOGGER.debug("LightScene %s added to hass", self.name)
 
-        scene_entities = list(self.scene_config.states)
-        if scene_entities:
-            self.async_on_remove(
-                async_track_state_change_event(
-                    self.hass,
-                    scene_entities,
-                    self.async_process_state_changed_event,
-                )
-            )
-
         if self.hass.state == CoreState.running:
             self.async_schedule_update_ha_state()
 
-    async def async_process_state_changed_event(self, event: Event):
-        """If external changes (unrecognized context), turn off LightScene."""
-
-        if not self._busy_reproducing_states.is_set() or not self._is_on:
-            return
-
-        entity_id = event.data.get(ATTR_ENTITY_ID, "")
-        new_state = event.data.get(EVENT_NEW_STATE)
-
-        if new_state is None or new_state.context is None:
-            return
-
-        if self._context and new_state.context.id == self._context.id:
-            internal = True
-        elif new_state.context.id in self._internal_contexts:
-            internal = True
-        else:
-            internal = False
-
-        if not internal:
-            _LOGGER.info(
-                "%s deactivated due to external change in entity %s",
-                self.name,
-                entity_id,
-            )
-            self._set_off()
-
     async def async_process_scene_activation_event(self, event: Event) -> None:
-        """
-        Called when the underlying scene is activated externally.
-        """
+        """Optimistic fast path: the underlying scene was activated. The
+        coordinator confirms (or corrects) once member states settle."""
 
-        if event is None or event.context is None:
+        if event is None:
             return
 
         _LOGGER.info("Scene '%s' activated.", self.scene_config.name)
 
-        await self._busy_reproducing_states.wait()
-
-        new_context = event.context
-        self._context = new_context
-        self.async_set_context(new_context)
-        self._internal_contexts.add(new_context.id)
+        if event.context is not None:
+            self.async_set_context(event.context)
 
         self._is_on = True
         self._brightness = self._scene_brightness
-
-        _LOGGER.debug(
-            "%s is now on at baseline brightness %d", self.name, self._brightness
-        )
-
         self.async_write_ha_state()
+        self.manager.coordinator.async_schedule(self.scene_entity_id)
 
     async def async_turn_on(self, **kwargs):
         """
@@ -381,14 +780,8 @@ class LightScene(LightEntity):
         await self._busy_reproducing_states.wait()
 
         try:
-            new_context = (
-                Context(self._context.user_id, self._context.id)
-                if self._context
-                else Context()
-            )
-            self._context = new_context
-            self.async_set_context(new_context)
-            self._internal_contexts.add(new_context.id)
+            reproduce_context = Context()
+            self.async_set_context(reproduce_context)
 
             target_brightness = kwargs.get(ATTR_BRIGHTNESS)
 
@@ -445,7 +838,7 @@ class LightScene(LightEntity):
             self._is_on = True
             self.async_write_ha_state()
 
-            await self._start_reproduce(states_to_reproduce, "states")
+            await self._start_reproduce(states_to_reproduce, "states", reproduce_context)
         except asyncio.CancelledError:
             if self._cancelled_reproduce:
                 _LOGGER.debug("Reproduce task cancelled for %s", self.name)
@@ -456,9 +849,17 @@ class LightScene(LightEntity):
             raise
 
         finally:
-            self._reproduce_task = None
             self._cancelled_reproduce = False
-            self._busy_reproducing_states.set()
+            # Only tidy up OUR finished work: when this invocation was cancelled
+            # by a newer toggle, that toggle may already own a live reproduce
+            # task — clearing its handle / setting the busy event here would
+            # unblock waiters mid-reproduce.
+            if self._reproduce_task is not None and self._reproduce_task.done():
+                self._reproduce_task = None
+            if self._reproduce_task is None:
+                self._busy_reproducing_states.set()
+            # Confirm the optimistic state against reality once things settle.
+            self.manager.coordinator.async_schedule(self.scene_entity_id)
 
     async def async_turn_off(self, **kwargs):
         """
@@ -468,10 +869,10 @@ class LightScene(LightEntity):
         await self._busy_reproducing_states.wait()
 
         try:
-            # if not self._is_on:
-            #     return
-
             _LOGGER.debug("Toggling off all entities of LightScene %s", self.name)
+
+            reproduce_context = Context()
+            self.async_set_context(reproduce_context)
 
             off_states = []
             for entity_id in self.scene_config.states:
@@ -479,7 +880,7 @@ class LightScene(LightEntity):
 
             self._set_off()
 
-            await self._start_reproduce(off_states, "off states")
+            await self._start_reproduce(off_states, "off states", reproduce_context)
         except asyncio.CancelledError:
             if self._cancelled_reproduce:
                 _LOGGER.debug("Reproduce task cancelled for %s", self.name)
@@ -490,9 +891,14 @@ class LightScene(LightEntity):
             raise
 
         finally:
-            self._reproduce_task = None
             self._cancelled_reproduce = False
-            self._busy_reproducing_states.set()
+            # See async_turn_on: never clobber a newer toggle's live reproduce.
+            if self._reproduce_task is not None and self._reproduce_task.done():
+                self._reproduce_task = None
+            if self._reproduce_task is None:
+                self._busy_reproducing_states.set()
+            # Confirm the optimistic state against reality once things settle.
+            self.manager.coordinator.async_schedule(self.scene_entity_id)
 
     def _set_off(self):
         """
@@ -500,7 +906,6 @@ class LightScene(LightEntity):
         """
 
         self._is_on = False
-        self._internal_contexts.clear()
         self.async_write_ha_state()
 
         _LOGGER.info("%s turned off", self.name)
@@ -532,11 +937,13 @@ class LightScene(LightEntity):
         finally:
             self._reproduce_task = None
 
-    async def _start_reproduce(self, states: list[State], label: str) -> None:
+    async def _start_reproduce(
+        self, states: list[State], label: str, context: Context | None = None
+    ) -> None:
         """Reproduce states with timeout handling."""
         self._busy_reproducing_states.clear()
         self._reproduce_task = asyncio.create_task(
-            async_reproduce_state(self.hass, states, context=self._context)
+            async_reproduce_state(self.hass, states, context=context)
         )
         try:
             await asyncio.wait_for(

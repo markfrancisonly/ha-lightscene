@@ -78,3 +78,5 @@ ctags.tmp
 
 # Built docs
 docs/build
+# Release notes are uploaded to the GitHub release, not committed
+RELEASE_NOTES*.md
