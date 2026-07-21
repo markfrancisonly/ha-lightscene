@@ -2,8 +2,7 @@
 <!-- markdownlint-disable no-inline-html -->
 
 [![GitHub Release](https://img.shields.io/github/release/markfrancisonly/ha-lightscene.svg?style=flat-square)](https://github.com/markfrancisonly/ha-lightscene/releases)
-[![License](https://img.shields.io/github/license/markfrancisonly/ha-lightscene.svg?style=flat-square)](LICENSE)
-[![hacs](https://img.shields.io/badge/HACS-default-orange.svg?style=flat-square)](https://hacs.xyz)
+[![License](https://img.shields.io/github/license/markfrancisonly/ha-lightscene.svg?style=flat-square)](https://github.com/markfrancisonly/ha-lightscene/blob/master/LICENSE)
 
 
 # LightScene Integration for Home Assistant
@@ -75,28 +74,30 @@ logger:
 
 ## Installation
 
-1. Copy the `lightscene` component folder into your Home Assistant `custom_components` directory.
+### HACS (Recommended)
 
-2. Restart Home Assistant to enable the component.
- 
+[![Open your Home Assistant instance and open a repository inside the Home Assistant Community Store.](https://my.home-assistant.io/badges/hacs_repository.svg)](https://my.home-assistant.io/redirect/hacs_repository/?owner=markfrancisonly&repository=ha-lightscene&category=integration)
 
-## Development Notes
+Or manually add the custom repository:
 
-The component includes the following key classes:
+<details>
+<summary>Step-by-step HACS installation</summary>
 
--  **LightSceneManager**: Manages discovery and lifecycle of `LightScene` entities.
--  **LightScene**: Represents a single light scene with brightness scaling and context management.
+1. Open **HACS** in your Home Assistant dashboard
+2. Click the **⋮** menu (top right) → **Custom repositories**
+3. Add this URL and set the category to **Integration**, then click **Add**:
+   ```
+   https://github.com/markfrancisonly/ha-lightscene
+   ```
+4. The repository now appears in the custom repositories list. Close the dialog.
+5. Back in HACS, search for **Video Call** and open the result
+6. Click **Download** (or **Install**) and confirm
+7. **Restart Home Assistant**
 
-  
-## Contributing
+</details>
 
-Contributions are welcome! Submit an issue or create a pull request on GitHub to propose improvements or report bugs.
+### Manual Installation
 
-
-## License
-
-This component is licensed under the MIT License. See the `LICENSE` file for more details.
-
----
-
-Happy automating! 🎉
+1. Download the [latest release](https://github.com/markfrancisonly/ha-lightscene/releases)
+2. Copy the contents into `custom_components/ha-lightscene/` inside your HA config directory
+3. Restart Home Assistant
