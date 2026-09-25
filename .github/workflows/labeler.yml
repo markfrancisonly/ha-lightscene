@@ -4,7 +4,7 @@ name: Manage labels
 on:
   push:
     branches:
-      - main
+      - master
   workflow_dispatch:
 
 jobs:
@@ -13,9 +13,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the repository
-        uses: actions/checkout@v2.3.4
+        uses: actions/checkout@v7
 
       - name: Run Labeler
-        uses: crazy-max/ghaction-github-labeler@v3.1.1
+        uses: crazy-max/ghaction-github-labeler@v6
         with:
           skip-delete: true

@@ -3,7 +3,7 @@ import logging
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import config_validation as cv, entity_registry as er
 from homeassistant.helpers.entity_registry import RegistryEntryDisabler
 
 from .const import DATA_MANAGER, DEFAULT_NAME, DOMAIN
@@ -13,16 +13,7 @@ SYNC_FLAG = f"{DOMAIN}_syncing_registry"
 
 _LOGGER = logging.getLogger(__name__)
 
-
-async def async_setup(hass: HomeAssistant, config: dict) -> bool:
-    """Set up the Light Scene component from configuration.yaml."""
-    if DOMAIN in config:
-        _LOGGER.warning(
-            "Configuration for Light Scene is managed via the UI. "
-            "Please remove '%s:' from configuration.yaml.",
-            DOMAIN,
-        )
-    return True
+CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
