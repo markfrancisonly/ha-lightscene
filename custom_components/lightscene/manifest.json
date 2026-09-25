@@ -1,7 +1,7 @@
 {
   "domain": "lightscene",
   "name": "LightScene",
-  "version": "1.2.2",
+  "version": "1.2.3",
   "dependencies": [],
   "requirements": [],
   "after_dependencies": [

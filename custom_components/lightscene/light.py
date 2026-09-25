@@ -69,6 +69,9 @@ async def async_setup_entry(
 
     manager = LightSceneManager(hass, config_entry, async_add_entities)
     hass.data[DATA_MANAGER] = manager
+    # An entry reload removes the entities; the bus listeners must go with them,
+    # or this manager keeps reacting to scene reloads after it is gone.
+    config_entry.async_on_unload(manager.async_release)
 
     await manager.async_load_lightscenes(reload=False)
 
@@ -213,6 +216,19 @@ class LightSceneManager:
         # (Re)index memberships and (re)subscribe the shared state listener.
         self.coordinator.async_rebuild()
 
+    @callback
+    def async_release(self) -> None:
+        """Stop the coordinator and drop the bus listeners."""
+        self.coordinator.async_shutdown()
+
+        if self.listener_scene_reloaded_release:
+            self.listener_scene_reloaded_release()
+            self.listener_scene_reloaded_release = None
+
+        if self.listener_scene_activated_release:
+            self.listener_scene_activated_release()
+            self.listener_scene_activated_release = None
+
     async def async_unload_lightscenes(self):
         """Clean up event listeners and remove entities."""
 
@@ -220,15 +236,12 @@ class LightSceneManager:
             "Unloading all LightScene entities",
         )
 
-        self.coordinator.async_shutdown()
-
-        if self.listener_scene_reloaded_release:
-            self.listener_scene_reloaded_release()
-
-        if self.listener_scene_activated_release:
-            self.listener_scene_activated_release()
+        self.async_release()
 
         for lightscene in self.lightscenes.values():
+            # Disabled entities were never added; removed ones are detached.
+            if lightscene.hass is None or lightscene.platform is None:
+                continue
             try:
                 await lightscene.async_remove()
                 _LOGGER.debug("Removed existing LightScene: %s", lightscene.name)
