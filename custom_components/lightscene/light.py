@@ -105,7 +105,7 @@ class LightSceneManager:
         Reload integration on scene reload event
         """
         _LOGGER.debug("Scenes reloaded")
-        await self.async_load_lightscenes()
+        await self.async_load_lightscenes(reload=True)
 
     @staticmethod
     @callback
@@ -153,24 +153,25 @@ class LightSceneManager:
         except Exception as e:
             _LOGGER.error("Error in scene activation listener: %s", e)
 
-    async def async_load_lightscenes(self, reload: bool | None = True):
-        """Discover HomeAssistantScene entities and create a LightScene for each."""
+    async def async_load_lightscenes(self, reload: bool = False):
+        """Discover HomeAssistantScene entities and keep one LightScene per scene.
 
-        if reload:
-            await self.async_unload_lightscenes()
+        On a scene reload, lights for scenes that still exist are updated in
+        place; only scenes that disappeared are removed and new ones added.
+        """
+
+        if not reload:
+            self.listener_scene_reloaded_release = self.hass.bus.async_listen(
+                EVENT_SCENE_RELOADED, self.async_scene_reloaded_event_listener
+            )
+            self.listener_scene_activated_release = self.hass.bus.async_listen(
+                EVENT_CALL_SERVICE,
+                self.async_scene_activated_event_listener,
+                event_filter=self._scene_turn_on_filter,
+            )
 
         _LOGGER.debug(
             "Started discovery of %s platform", HOMEASSISTANT_SCENE_DATA_PLATFORM
-        )
-
-        self.listener_scene_reloaded_release = self.hass.bus.async_listen(
-            EVENT_SCENE_RELOADED, self.async_scene_reloaded_event_listener
-        )
-
-        self.listener_scene_activated_release = self.hass.bus.async_listen(
-            EVENT_CALL_SERVICE,
-            self.async_scene_activated_event_listener,
-            event_filter=self._scene_turn_on_filter,
         )
 
         if HOMEASSISTANT_SCENE_DATA_PLATFORM not in self.hass.data:
@@ -189,7 +190,7 @@ class LightSceneManager:
             if isinstance(opts.get(CONF_DISABLED_SCENES), list):
                 disabled = set(opts[CONF_DISABLED_SCENES])
 
-        new_entities = []
+        discovered: Dict[str, SceneConfig] = {}
         for entity_id, scene_entity in scene_platform.entities.items():
             if not isinstance(scene_entity, HomeAssistantScene):
                 _LOGGER.debug(
@@ -198,12 +199,21 @@ class LightSceneManager:
                     type(scene_entity),
                 )
                 continue
+            discovered[entity_id] = cast(HomeAssistantScene, scene_entity).scene_config
 
+        for entity_id in [e for e in self.lightscenes if e not in discovered]:
+            await self._async_remove_lightscene(self.lightscenes.pop(entity_id))
+
+        new_entities = []
+        for entity_id, scene_config in discovered.items():
+            if (lightscene := self.lightscenes.get(entity_id)) is not None:
+                lightscene.async_update_scene(scene_config)
+                continue
             lightscene = LightScene(
                 hass=self.hass,
                 manager=self,
                 scene_entity_id=entity_id,
-                scene_config=cast(HomeAssistantScene, scene_entity).scene_config,
+                scene_config=scene_config,
                 is_disabled_by_default=(entity_id in disabled),
             )
             self.lightscenes[entity_id] = lightscene
@@ -211,10 +221,23 @@ class LightSceneManager:
 
         if new_entities:
             self.async_add_entities(new_entities)
-            _LOGGER.debug("Added %d LightScene entities.", len(self.lightscenes))
+        _LOGGER.debug(
+            "%d LightScene entities, %d new.", len(self.lightscenes), len(new_entities)
+        )
 
         # (Re)index memberships and (re)subscribe the shared state listener.
         self.coordinator.async_rebuild()
+
+    @staticmethod
+    async def _async_remove_lightscene(lightscene: "LightScene") -> None:
+        # Disabled entities were never added; removed ones are detached.
+        if lightscene.hass is None or lightscene.platform is None:
+            return
+        try:
+            await lightscene.async_remove()
+            _LOGGER.debug("Removed LightScene: %s", lightscene.name)
+        except Exception as e:
+            _LOGGER.error("Error removing LightScene %s: %s", lightscene.name, e)
 
     @callback
     def async_release(self) -> None:
@@ -228,27 +251,6 @@ class LightSceneManager:
         if self.listener_scene_activated_release:
             self.listener_scene_activated_release()
             self.listener_scene_activated_release = None
-
-    async def async_unload_lightscenes(self):
-        """Clean up event listeners and remove entities."""
-
-        _LOGGER.debug(
-            "Unloading all LightScene entities",
-        )
-
-        self.async_release()
-
-        for lightscene in self.lightscenes.values():
-            # Disabled entities were never added; removed ones are detached.
-            if lightscene.hass is None or lightscene.platform is None:
-                continue
-            try:
-                await lightscene.async_remove()
-                _LOGGER.debug("Removed existing LightScene: %s", lightscene.name)
-            except Exception as e:
-                _LOGGER.error("Error removing LightScene %s: %s", lightscene.name, e)
-
-        self.lightscenes.clear()
 
 
 class SceneStateCoordinator:
@@ -611,11 +613,26 @@ class LightScene(LightEntity, RestoreEntity):
         # Control default enabled/disabled status in the entity registry
         self._attr_entity_registry_enabled_default = not is_disabled_by_default
 
-        self._scene_brightness_levels: Dict[str, int] = {}
         self._busy_reproducing_states = asyncio.Event()
         self._busy_reproducing_states.set()
         self._reproduce_task: asyncio.Task | None = None
         self._cancelled_reproduce = False
+
+        self._compile()
+        self._brightness = self._scene_brightness
+
+    @callback
+    def async_update_scene(self, scene_config: SceneConfig) -> None:
+        """Take a reloaded scene's config without leaving Home Assistant: a
+        remove and re-add would pass every scene light through unavailable."""
+        self.scene_config = scene_config
+        self._compile()
+        if self.hass is not None and self.entity_id is not None:
+            self.async_write_ha_state()
+
+    def _compile(self) -> None:
+        """Derive targets, baseline brightness and color mode from the scene."""
+        self._scene_brightness_levels: Dict[str, int] = {}
 
         # Compile the matching target table (used by the coordinator) while
         # determining the baseline brightness.
@@ -653,11 +670,9 @@ class LightScene(LightEntity, RestoreEntity):
             self._scene_brightness = sum(scene_brightness_values) // len(
                 scene_brightness_values
             )
-            self._brightness = self._scene_brightness
             self._has_brightness_control = True
         else:
             self._scene_brightness = DEFAULT_BRIGHTNESS
-            self._brightness = self._scene_brightness
             self._has_brightness_control = False
 
         if self._has_brightness_control:
