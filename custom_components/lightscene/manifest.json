@@ -1,19 +1,19 @@
 {
   "domain": "lightscene",
   "name": "LightScene",
-  "version": "2026.9.1",
-  "dependencies": [],
-  "requirements": [],
   "after_dependencies": [
     "light",
     "scene"
   ],
-  "iot_class": "local_push",
-  "config_flow": true,
-  "single_config_entry": true,
   "codeowners": [
     "@markfrancisonly"
   ],
+  "config_flow": true,
+  "dependencies": [],
   "documentation": "https://github.com/markfrancisonly/ha-lightscene#readme",
-  "issue_tracker": "https://github.com/markfrancisonly/ha-lightscene/issues"
+  "iot_class": "local_push",
+  "issue_tracker": "https://github.com/markfrancisonly/ha-lightscene/issues",
+  "requirements": [],
+  "single_config_entry": true,
+  "version": "2026.9.1"
 }
